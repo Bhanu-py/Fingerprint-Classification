@@ -1,6 +1,11 @@
 # History files
 .Rhistory
 .Rapp.history
+data/
+preprocessed_NIST.rds
+processed_SFinGe.rds
+xgboost_tuned.rds
+knn_tuned.rds
 
 # Session Data files
 .RData
