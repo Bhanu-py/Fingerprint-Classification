@@ -145,7 +145,7 @@ sum(is.na(tot))
 
 # saving the pre processed NIST data 
 # saveRDS(tot, 'processed_NIST.rds')
-tot <- readRDS('preprocessed_NIST.rds')
+tot1 <- readRDS('preprocessed_NIST.rds')
 ```
 
 
@@ -315,8 +315,7 @@ dim(dftest)
 knn_rec <- recipe(label ~ ., data=tot_train) %>%
   step_scale(all_numeric_predictors)
 
-knn_mod <- 
-  nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+knn_mod <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
   set_engine("kknn") %>% 
   set_mode("classification")
 
@@ -341,7 +340,7 @@ registerDoParallel(cls)
 ctrl <- control_bayes(verbose = TRUE)
 set.seed(2022)
 # Hyper parameter tuning by bayesian optimization
-knn_search <- tune_bayes(knn_wflow, resamples = tot_folds, initial = 5, iter = 20,
+knn_search <- tune_bayes(knn_wflow, resamples = df_folds, initial = 5, iter = 20,
                          param_info = knn_param, control = ctrl)
 saveRDS(knn_search, 'models/NIST/knn_tuned.rds')
 knn_tuned <- readRDS('models/NIST/knn_tuned.rds')
@@ -349,40 +348,37 @@ knn_tuned <- readRDS('models/NIST/knn_tuned.rds')
 ```
 
 ```{r}
-knn_best_param <- knn_tuned %>% select_best('roc_auc')
-knn_final <- knn_mod %>% finalize_model(knn_best_param)
+knn_best_param <- knn_search %>% select_best('roc_auc')
+
+knn_final <- knn_mod %>% 
+              finalize_model(knn_best_param) %>%
+              fit( formula = label ~ .,data = dftrain)
+                
 saveRDS(knn_final, 'models/NIST/knn_final.rds')
 knn_final <- readRDS('models/NIST/knn_final.rds')
 ```
 
 ```{r}
 pred_df <- bind_cols(
-  predict(knn_cls_features_fit, dftest),
-  predict(knn_cls_features_fit, dftest, type = "prob"))
+  ytest,
+  predict(knn_final, dftest),
+  predict(knn_final, dftest, type = "prob"))
 
-pred_df$obs <- ytest
 # pred_df$.pred <- pmax(pred_df$pred_A, pred_df$pred_L, pred_df$pred_R, pred_df$pred_T, pred_df$pred_W)
-colnames(pred_df) <- c("pred","pred_A","pred_L", "pred_R","pred_T","pred_W", "obs")
-
-confusionMatrix(pred_df$pred, ytest)
+colnames(pred_df) <- c("obs", "pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+pred_df
+cm_knn_NIST <- confusionMatrix(pred_df$pred, ytest)
+saveRDS(cm_knn_NIST, 'results/NIST/cm_knn_NIST.rds')
+cm_knn_NIST
 pred_df %>%
   roc_curve(obs, pred_A:pred_W) %>%
-  lines.roc()
+  autoplot()
 ```
 
 
 
 
 ## `Support Vector Machines`
-Selecting Features from Boost Trees
-```{r Features}
-nf <- 300
-dftrain <- training(tot_split) %>% select(imp_df$Feature[1:nf], label)
-dftest <- testing(tot_split) %>% select(imp_df$Feature[1:nf])
-ytest <- testing(tot_split)$label
-dim(dftrain)
-dim(dftest)
-```
 
 ```{r tune_svm}
 svm_rec <- 
@@ -423,7 +419,7 @@ start_grid <- svm_wflow %>%
 
 doParallel::registerDoParallel()
 svm_initial <- svm_wflow %>% 
-              tune_grid(resamples = tot_folds, 
+              tune_grid(resamples = df_folds, 
                         grid = start_grid, 
                         metrics = roc_res)
 
