@@ -4,11 +4,13 @@
 data/
 preprocessed_NIST.rds
 processed_SFinGe.rds
+processed_NIST.rds
 xgboost_tuned.rds
 knn_tuned.rds
 
 # Session Data files
 .RData
+.RDataTmp
 
 # User-specific files
 .Ruserdata

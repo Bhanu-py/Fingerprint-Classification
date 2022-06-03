@@ -1,0 +1,542 @@
+---
+title: "NIST Classification"
+author: "Bhanu Angam"
+date: "5/24/2022"
+output:
+  word_document:
+    toc: yes
+  html_document:
+    toc: yes
+    theme: paper
+---
+
+```{r Libraries, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tidymodels)
+library(skimr)
+library(scutr)
+library(caret)
+library(dplyr)
+library(xgboost)
+```
+
+## Data Pre-processing
+
+```{r loading data}
+
+df1 <- read.csv('data/NISTDB4-F.csv', header=FALSE)
+df1$quality <- 'F'
+
+df2 <- read.csv('data/NISTDB4-S.csv', header=FALSE)
+df2$quality <- 'S'
+
+tot <- rbind(df1,df2)
+tot[1:6,1:6]
+```
+
+### Check for NA
+```{r Check for NA}
+colnames(tot)[ncol(tot)-1] <- 'label'
+tot$quality <- as.factor(tot$quality)
+tot$label <- as.factor(tot$label)
+table(tot$quality, tot$label)
+
+map_chr(tot, typeof) %>% 
+  tibble() %>% 
+  table()
+sum(is.na(tot))
+```
+
+
+#### Missing Values Treatment #####
+```{r}
+df <- modify(tot[,1:(ncol(tot)-2)], is.na) %>% 
+  colSums() %>%
+  tibble(names = colnames(tot[,1:(ncol(tot)-2)]),missing_values=.) %>% 
+  arrange(-missing_values)
+
+hist(df[df$missing_values != 0,]$missing_values,labels = TRUE, xlim = c(0,3300), breaks = 50)
+
+# Removing columns with 50% of total rows having missing values
+names <- modify(tot[,1:(ncol(tot)-2)], is.na) %>% 
+  colSums() %>%
+  tibble(names = colnames(tot[,1:(ncol(tot)-2)]), missing_values=.) %>% 
+  filter(missing_values < 1500) %>% 
+  dplyr::select(1)
+
+tot <- tot[c(names$names, 'quality', 'label')]
+
+
+## Imputing remaining predictors with less than 1500 missing values
+library(naniar)
+vis_miss(tot[,846:1019])
+tot <- tot %>% 
+      mutate_if(is.numeric, function(x) ifelse(is.na(x), median(x, na.rm = T), x))
+sum(is.na(tot))
+```
+
+
+### Remove Outliers
+```{r oulier treatment}
+cap <- function(x){
+  quantiles <- quantile( x, c(.05, 0.25, 0.75, .95 ) )
+  x[ x < quantiles[2] - 1.5*IQR(x) ] <- quantiles[1]
+  x[ x > quantiles[3] + 1.5*IQR(x) ] <- quantiles[4]
+  x}
+
+boxplot(tot[, 1:6])
+
+tot <- tot %>% mutate_if(is.numeric, cap)
+
+```
+
+### Zero Varinace columns
+Finding if columns have Zero Variance that gives NAs while scaling
+```{r}
+##### Finding if columns have Zero Variance that gives NAs while scaling
+x <- cbind(lapply(tot[,1:(ncol(tot)-2)], FUN = var, na.rm = T))
+
+vardf <- data.frame('col' = rownames(x), 'variation' = unlist(x))
+vardf$col[round(vardf$variation, 5) == 0.0000]
+zero_var <- vardf[order(vardf$variation),]
+# str(tot$V1312)
+
+# remove columns with zero variance
+quality <- tot$quality
+label <- tot$label
+tot  <- tot[,!(round(vardf$variation, 5) == 0.0000)]
+tot$label <- label
+tot$quality <- quality
+rm(quality)
+rm(label)
+dim(tot) 
+
+boxplot(tot[, 1:6])
+
+```
+
+
+### Class Balancing
+```{r}
+table(tot$label)
+prop.table(table(tot$label))
+plot(table(tot$label), type="h")
+```
+```{r}
+tot_f <- tot[tot$quality == 'F',]
+tot_s <- tot[tot$quality == 'S',]
+
+smoted_fT <- oversample_smote((tot_f %>% dplyr::select(-'quality')), "T", "label", 150)
+smoted_sT <- oversample_smote((tot_s %>% dplyr::select(-'quality')), "T", "label", 150)
+
+smoted_fT$quality = 'F'
+smoted_sT$quality = 'S'
+table(smoted_fT$label)
+table(smoted_sT$label)
+tot <- rbind(tot, smoted_fT, smoted_sT)
+
+table(tot$label)
+prop.table(table(tot$label))
+plot(table(tot$label), type="h")
+
+## Glimpse first 10 columns
+head(tot[, 1:6], n = 7)
+dim(tot)
+sum(is.na(tot))
+
+# saving the pre processed NIST data 
+saveRDS(tot, 'processed_NIST.rds')
+tot <- readRDS('processed_NIST.rds')
+```
+
+## Train Test Splits
+```{r}
+set.seed(2022)
+# Split data 70%-30% into training set and test set
+tot_split <- as_tibble(tot) %>%
+  mutate_if(is.numeric, scale) %>%
+  initial_split(prop = 0.70, strata = label)
+
+# Extract data in each split
+tot_train <- training(tot_split)
+tot_test <- testing(tot_split) %>% dplyr::select(-label)
+ytest <- testing(tot_split)$label
+
+tot_folds <- vfold_cv(training(tot_split), v = 5, strata = label)
+# Print the number of observations in each split
+cat("Training cases: ", nrow(tot_train), "\n",
+    "Test cases: ", nrow(tot_test), sep = "")
+
+```
+
+
+## KNN with full data
+### Bayesian Optimization for Hyper parameter Tuning
+### Model Specification
+
+```{r KNN Model Specification for full data , eval=FALSE, include=TRUE}
+knn_rec <- recipe(label ~ ., data=tot_train) %>%
+  step_normalize(all_numeric_predictors)
+
+knn_mod <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+knn_wflow <- workflow() %>% 
+  add_model(knn_mod) %>% 
+  add_formula(label ~ .)
+
+knn_param <- knn_wflow %>% 
+  parameters() %>% 
+    update(
+    neighbors = neighbors(c(3, 50)),
+    weight_func = weight_func(values = c("rectangular", "gaussian", "triangular"))
+  )
+
+library(doParallel)
+all_cores <- detectCores(logical = FALSE)
+cls <- makePSOCKcluster(all_cores)
+registerDoParallel(cls)
+ctrl <- control_bayes(verbose = TRUE)
+set.seed(2022)
+# Hyper parameter tuning by bayesian optimization
+knn_search_full <- tune_bayes(knn_wflow, resamples = tot_folds, 
+                         initial = 5, iter = 20,
+                         param_info = knn_param, control = ctrl)
+
+saveRDS(knn_search_full, 'models/NIST/knn_tuned_full.rds')
+knn_tuned_full <- readRDS('models/NIST/knn_tuned_full.rds')
+
+```
+
+```{r eval=FALSE, include=FALSE}
+
+knn_best_param <- knn_tuned_full %>% select_best('roc_auc')
+
+knn_final_full <- knn_mod %>% 
+              finalize_model(knn_best_param) %>%
+              fit( formula = label ~ .,data = tot_train)
+                
+saveRDS(knn_final_full, 'models/NIST/knn_final_full.rds')
+knn_final_full <- readRDS('models/NIST/knn_final_full.rds')
+```
+
+```{r}
+knn_final_full <- readRDS('models/NIST/knn_final_full.rds')
+
+pred_df <- bind_cols(ytest,
+                    predict(knn_final_full, tot_test),
+                    predict(knn_final_full, tot_test, type = "prob"))
+
+colnames(pred_df) <- c("obs", "pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+
+saveRDS(pred_df, 'results/NIST/knn_full_pred_df.rds')
+pred_df <- readRDS('results/NIST/knn_full_pred_df.rds')
+
+pred_df %>%
+  f_meas(obs, pred)
+
+cm_knn_full_NIST <- confusionMatrix(pred_df$pred, ytest)
+saveRDS(cm_knn_full_NIST, 'results/NIST/cm_knn_full_NIST.rds')
+cm_knn_full_NIST
+pred_df %>%
+  roc_curve(obs, pred_A:pred_W) %>%
+  autoplot()
+```
+
+
+## Boost Tree with full Data
+#### model specification
+```{r eval=FALSE, include=TRUE}
+
+  # XGBoost model specification
+xgboost_model <- 
+  parsnip::boost_tree(
+    mode = "classification",
+    trees = 100,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) %>%
+    set_engine("xgboost")
+
+# grid specification
+xgboost_params <- 
+  dials::parameters(
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction()
+  )
+
+xgboost_grid <- 
+  dials::grid_max_entropy(
+    xgboost_params, 
+    size = 4
+  )
+
+head(xgboost_grid)
+
+xgboost_wf <- workflow() %>%
+  add_model(xgboost_model) %>% 
+  add_formula(label ~ .)
+
+# hyper parameter tuning
+library(doParallel)
+all_cores <- detectCores(logical = FALSE)
+cls <- makePSOCKcluster(all_cores)
+registerDoParallel(cls)
+set.seed(234)
+xgboost_tuned_full <- tune_grid(
+  object = xgboost_wf,
+  resamples = tot_folds,
+  grid = xgboost_grid,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+saveRDS(xgboost_tuned_full, 'models/NIST/xgboost_tuned_full.rds')
+xgboost_tuned_full <- readRDS('models/NIST/xgboost_tuned_full.rds')
+
+xgboost_tuned_full %>%
+  collect_metrics(metric='accuracy') %>%
+  knitr::kable()
+xgboost_tuned_full %>%
+  select_best('accuracy')
+
+xgboost_best_param <- xgboost_tuned_full %>%
+                        select_best('roc_auc')
+## fit the model on all the training data
+xgboost_final_full <- xgboost_model %>%
+                  finalize_model(xgboost_best_param)  %>%
+                  # fit the model on all the training data
+                  fit( formula = label ~ .,data = tot_train)
+saveRDS(xgboost_final_full, 'models/NIST/xgboost_final_full.rds')
+xgboost_final_full <- readRDS('models/NIST/xgboost_final_full.rds')
+
+```
+
+#### Testing model on Test data
+```{r}
+xgboost_final_full <- readRDS('models/NIST/xgboost_final_full.rds')
+
+pred_df <- bind_cols(
+    testing(tot_split)$label,
+    predict(xgboost_final_full, tot_test),
+    predict(xgboost_final_full, tot_test, type = "prob"))
+
+colnames(pred_df) <- c("obs","pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+saveRDS(pred_df, 'results/NIST/xgboost_full_pred_df')
+pred_df <- readRDS('results/NIST/xgboost_full_pred_df')
+
+pred_df %>%
+  f_meas(obs, pred)
+
+cm_xgboost_full_NIST <- confusionMatrix(pred_df$pred, testing(tot_split)$label)
+cm_xgboost_full_NIST
+saveRDS(cm_xgboost_full_NIST, 'results/NIST/cm_xgboost_full_NIST.rds')
+pred_df %>%
+  roc_curve(obs, pred_A:pred_W) %>%
+  autoplot()
+
+```
+
+
+
+#### Feature Importance
+```{r}
+imp_df = xgb.importance(model=xgboost_final_full$fit)
+head(imp_df$Feature, 10)
+
+xgb.importance(model=xgboost_final_full$fit) %>% xgb.ggplot.importance(top_n=50, measure=NULL, rel_to_first = FALSE) 
+dim(imp_df)
+saveRDS(imp_df, 'models/NIST/feature_imp.rds')
+imp_df <- readRDS('models/NIST/feature_imp.rds')
+```
+
+## Selecting Features from Boost Trees
+```{r features}
+nf <- 300
+dftrain <- training(tot_split) %>% dplyr::select(imp_df$Feature[1:nf], label)
+dftest <- testing(tot_split)  %>% dplyr::select(imp_df$Feature[1:nf])
+ytest <- testing(tot_split)$label
+df_folds <- vfold_cv(training(tot_split) %>% dplyr::select(imp_df$Feature[1:nf], label), v = 5, strata = label)
+
+dim(dftrain)
+dim(dftest)
+```
+
+
+## Boost Tree with Feature Selection
+##### model specification
+```{r eval=FALSE, include=TRUE}
+
+  # XGBoost model specification
+xgboost_model <- parsnip::boost_tree(mode = "classification",
+                                      trees = 100,
+                                      min_n = tune(),
+                                      tree_depth = tune(),
+                                      learn_rate = tune(),
+                                      loss_reduction = tune()) %>%
+                                      set_engine("xgboost")
+
+# grid specification
+xgboost_params <- dials::parameters(min_n(),
+                            tree_depth(),
+                            learn_rate(),
+                            loss_reduction())
+
+xgboost_grid <- dials::grid_max_entropy(
+                            xgboost_params, 
+                            size = 4)
+
+head(xgboost_grid)
+
+xgboost_wf <- workflow() %>%
+                add_model(xgboost_model) %>% 
+                add_formula(label ~ .)
+
+# hyper parameter tuning
+library(doParallel)
+all_cores <- detectCores(logical = FALSE)
+cls <- makePSOCKcluster(all_cores)
+registerDoParallel(cls)
+set.seed(234)
+## Grid Tune
+xgboost_tuned_features <- tune_grid(
+  object = xgboost_wf,
+  resamples = df_folds,
+  grid = xgboost_grid,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_grid(verbose = TRUE, save_pred = TRUE))
+
+saveRDS(xgboost_tuned_features, 'models/NIST/xgboost_tuned_features.rds')
+xgboost_tuned_features <- readRDS('models/NIST/xgboost_tuned_features.rds')
+
+xgboost_tuned_features %>%
+  collect_metrics(metric='accuracy') %>%
+  knitr::kable()
+xgboost_tuned_features %>%
+  select_best('accuracy')
+
+xgboost_best_param <- xgboost_tuned_features %>%
+                        select_best('roc_auc')
+## fit the model on all the training data
+xgboost_final_features <- xgboost_model %>%
+                  finalize_model(xgboost_best_param)  %>%
+                  # fit the model on all the training data
+                  fit( formula = label ~ .,data = dftrain)
+
+saveRDS(xgboost_final_features, 'models/NIST/xgboost_final_features.rds')
+xgboost_final_features <- readRDS('models/NIST/xgboost_final_features.rds')
+
+```
+
+
+#### Testing model on Test data
+```{r}
+xgboost_final_features <- readRDS('models/NIST/xgboost_final_features.rds')
+
+pred_df <- bind_cols(
+    testing(tot_split)$label,
+    predict(xgboost_final_features, dftest),
+    predict(xgboost_final_features, dftest, type = "prob"))
+
+colnames(pred_df) <- c("obs","pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+
+saveRDS(pred_df, 'results/NIST/xgboost_features_pred_df.rds')
+pred_df <- readRDS('results/NIST/xgboost_features_pred_df.rds')
+
+pred_df %>%
+  f_meas(obs, pred)
+
+cm_xgboost_features <- confusionMatrix(pred_df$pred, testing(tot_split)$label)
+cm_xgboost_features
+saveRDS(cm_xgboost_features, 'results/NIST/cm_xgboost_features.rds')
+pred_df %>%
+  roc_curve(obs, pred_A:pred_W) %>%
+  autoplot()
+
+```
+
+
+## KNN nearest neighbours with Feature Selection
+
+### Bayesian Optimization for Hyper parameter Tuning
+##### Model Specification
+```{r Model Specification, eval=FALSE, include=TRUE}
+knn_rec <- recipe(label ~ ., data=tot_train) %>%
+  step_scale(all_numeric_predictors)
+
+knn_mod <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+knn_wflow <- 
+  workflow() %>% 
+  add_model(knn_mod) %>% 
+  add_formula(label ~ .)
+
+knn_param <- 
+  knn_wflow %>% 
+  parameters() %>% 
+    update(
+    neighbors = neighbors(c(3, 50)),
+    weight_func = weight_func(values = c("rectangular", "gaussian", "triangular"))
+  )
+
+
+library(doParallel)
+all_cores <- detectCores(logical = FALSE)
+cls <- makePSOCKcluster(all_cores)
+registerDoParallel(cls)
+ctrl <- control_bayes(verbose = TRUE)
+set.seed(2022)
+# Hyper parameter tuning by bayesian optimization
+knn_search_features <- tune_bayes(knn_wflow, resamples = df_folds, initial = 5, iter = 20,
+                         param_info = knn_param, control = ctrl)
+saveRDS(knn_search_features, 'models/NIST/knn_tuned_features.rds')
+knn_tuned_features <- readRDS('models/NIST/knn_tuned_features.rds')
+
+```
+
+```{r eval=FALSE, include=TRUE}
+knn_best_param <- knn_tuned_features %>% select_best('roc_auc')
+## Fit Full train data with best parameters from tuning
+knn_final_features <- knn_mod %>%
+              finalize_model(knn_best_param) %>%
+              fit( formula = label ~ .,data = dftrain)
+
+saveRDS(knn_final_features, 'models/NIST/knn_final_features.rds')
+knn_final_features <- readRDS('models/NIST/knn_final_features.rds')
+```
+
+### testing model on test data
+```{r}
+knn_final_features <- readRDS('models/NIST/knn_final_features.rds')
+
+pred_df <- bind_cols(
+  ytest,
+  predict(knn_final_features, dftest),
+  predict(knn_final_features, dftest, type = "prob"))
+
+colnames(pred_df) <- c("obs", "pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+saveRDS(pred_df, 'results/NIST/knn_features_pred_df.rds')
+pred_df <- readRDS('results/NIST/knn_features_pred_df.rds')
+
+pred_df %>%
+  f_meas(obs, pred)
+
+cm_knn_features_NIST <- confusionMatrix(pred_df$pred, ytest)
+cm_knn_features_NIST
+saveRDS(cm_knn_features_NIST, 'results/NIST/cm_knn_NIST_features.rds')
+
+pred_df %>%
+  roc_curve(obs, pred_A:pred_W) %>%
+  autoplot()
+```
+
+

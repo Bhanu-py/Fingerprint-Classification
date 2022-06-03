@@ -1,0 +1,524 @@
+---
+title: "Multi-Class Classification (SFinGe)"
+author: "Bhanu Angam"
+date: "03/06/2022"
+output:
+  word_document:
+    toc: yes
+  html_document:
+    toc: yes
+    theme: paper
+---
+
+```{r Libraries, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tidymodels)
+library(skimr)
+library(scutr)
+library(caret)
+library(xgboost)
+```
+
+## Data Pre-processing
+
+```{r loading data, eval=TRUE, include=TRUE}
+df1 <- read.csv('data/SFinGe_Default.csv', header = FALSE)
+df1$quality <- 'default'
+
+df2 <- read.csv('data/SFinGe_HQNoPert.csv', header = FALSE)
+df2$quality <- 'hq'
+
+df3 <- read.csv('data/SFinGe_VQAndPert.csv', header = FALSE)
+df3$quality <- 'vq'
+
+tot <- rbind(df1,df2,df3)
+tot[1:6, 1:6]
+```
+
+### Check for NA
+```{r Check for NA}
+colnames(tot)[ncol(tot)-1] <- 'label'
+tot$quality <- as.factor(tot$quality)
+tot$label <- as.factor(tot$label)
+table(tot$quality, tot$label)
+sum(is.na(tot))
+```
+### Remove Outliers
+```{r oulier treatment, eval=TRUE, include=TRUE}
+cap <- function(x){
+  quantiles <- quantile( x, c(.05, 0.25, 0.75, .95 ) )
+  x[ x < quantiles[2] - 1.5*IQR(x) ] <- quantiles[1]
+  x[ x > quantiles[3] + 1.5*IQR(x) ] <- quantiles[4]
+  x}
+
+boxplot(tot[, 1:6])
+
+tot <- tot %>% mutate_if(is.numeric, cap)
+
+```
+
+### Zero Varinace columns
+Finding if columns have Zero Variance that gives NAs while scaling
+```{r}
+x <- cbind(lapply(tot[,1:(ncol(tot)-2)], FUN = var, na.rm = T))
+
+vardf <- data.frame('col' = rownames(x), 'variation' = unlist(x))
+vardf$col[round(vardf$variation,4) == 0.000]
+zero_var <- vardf[order(vardf$variation),]
+str(tot$V1312)
+label <- tot$label
+quality <- tot$quality
+# remove columns with zero variance
+tot  <- tot[,!(round(vardf$variation, 4) == 0.000)]
+tot$label <- label
+tot$quality <- quality
+
+tot <- (tot[, sapply(tot, function(x) length(unique(x)) > 3)[1:(ncol(tot)-2)]])
+dim(tot)
+boxplot(tot[, 1:6])
+```
+### Class Balancing
+
+```{r}
+#-------------------------------balancing class using SMOTE for TRAINSET -------------------- 
+plot(table(tot$label), type="h")
+```
+```{r SMOTE}
+prop.table(table(tot$label))
+tot_de <- tot[tot$quality == 'default',]
+tot_hq <- tot[tot$quality == 'hq',]
+tot_vq <- tot[tot$quality == 'vq',]
+dim(tot_de)
+
+## SMOTE for class A
+smoted_deA <- oversample_smote((tot_de %>% select(-quality)), "A", 'label', 700)
+smoted_hqA <- oversample_smote((tot_hq %>% select(-quality)), "A", 'label', 700)
+smoted_vqA <- oversample_smote((tot_vq %>% select(-quality)), "A", 'label', 700)
+
+smoted_deA$quality <- 'default'
+smoted_hqA$quality <- 'hq'
+smoted_vqA$quality <- 'vq'
+
+tot <- rbind(tot, smoted_deA, smoted_hqA, smoted_vqA)
+
+## SMOTE for class T
+smoted_deT <- oversample_smote((tot_de %>% select(-quality)), "T", 'label', 700)
+smoted_hqT <- oversample_smote((tot_hq %>% select(-quality)), "T", 'label', 700)
+smoted_vqT <- oversample_smote((tot_vq %>% select(-quality)), "T", 'label', 700)
+
+smoted_deT$quality <- 'default'
+smoted_hqT$quality <- 'hq'
+smoted_vqT$quality <- 'vq'
+
+tot <- rbind(tot, smoted_deT, smoted_hqT, smoted_vqT)
+
+plot(prop.table(table(tot$label)))
+
+dim(tot)
+sum(is.na(tot))
+# tot %>% glimpse()
+
+# saving the pre processed SFinGe data 
+saveRDS(tot, 'processed_SFinGe.rds')
+tot <- readRDS('processed_SFinGe.rds')
+```
+
+
+## Train Test Splits
+```{r}
+set.seed(2022)
+# Split data 70%-30% into training set and test set
+tot_split <- as_tibble(tot) %>% 
+  mutate_if(is.numeric, scale) %>%
+  initial_split(prop = 0.70, strata = label)
+
+# Extract data in each split
+tot_train <- training(tot_split)
+tot_test <- testing(tot_split) %>% select(-label)
+ytest <- testing(tot_split)$label
+
+tot_folds <- vfold_cv(training(tot_split), v = 5, strata = label)
+# Print the number of observations in each split
+cat("Training cases: ", nrow(tot_train), "\n",
+    "Test cases: ", nrow(tot_test), sep = "")
+
+```
+
+
+
+## KNN with full data
+### Bayesian Optimization for Hyper parameter Tuning
+##### Model Specifications
+
+```{r Model Specification, eval=FALSE, include=TRUE}
+
+knn_mod <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+knn_wflow <- 
+  workflow() %>% 
+  add_model(knn_mod) %>% 
+  add_formula(label ~ .)
+
+knn_param <- 
+  knn_wflow %>% 
+  parameters() %>% 
+    update(
+    neighbors = neighbors(c(3, 50)),
+    weight_func = weight_func(values = c("rectangular", "gaussian", "triangular"))
+  )
+
+library(doParallel)
+all_cores <- detectCores(logical = FALSE)
+cls <- makePSOCKcluster(all_cores)
+registerDoParallel(cls)
+ctrl <- control_bayes(verbose = TRUE)
+set.seed(2022)
+
+# Hyper parameter tuning by bayesian optimization
+knn_search_full <- tune_bayes(knn_wflow, resamples = tot_folds, 
+                         initial = 5, iter = 20,
+                         param_info = knn_param, control = ctrl)
+
+saveRDS(knn_search_full, 'models/SFinGe/knn_tuned_full.rds')
+knn_tuned_full <- readRDS('models/SFinGe/knn_tuned_full.rds')
+
+```
+
+Training the model on full data with the optimum Hyper-parameters
+```{r eval=FALSE, include=TRUE}
+knn_best_param <- knn_tuned_full %>% select_best('roc_auc')
+
+knn_final_full <- knn_mod %>% 
+              finalize_model(knn_best_param) %>%
+              fit( formula = label ~ .,data = tot_train)
+                
+saveRDS(knn_final_full, 'models/SFinGe/knn_final_full.rds')
+knn_final_full <- readRDS('models/SFinGe/knn_final_full.rds')
+```
+```{r final knn model on full data}
+knn_final_full <- readRDS('models/SFinGe/knn_final_full.rds')
+knn_final_full$spec
+```
+### testing accuracies with full model
+```{r}
+cm_knn_full_SFinGe <- read_rds('results/SFinGe/cm_knn_full_SFinGe.rds')
+
+# pred_df <- bind_cols(ytest,
+#                     predict(knn_final_full, tot_test),
+#                     predict(knn_final_full, tot_test, type = "prob"))
+# saveRDS(pred_df, 'results/SFinGe/knn_pred_df.rds')
+pred_df <- readRDS('results/SFinGe/knn_pred_df.rds')
+
+colnames(pred_df) <- c("obs", "pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+
+pred_df %>%
+  f_meas(obs, pred)
+
+cm_knn_full_SFinGe <- confusionMatrix(pred_df$pred, ytest)
+
+# saveRDS(cm_knn_full_SFinGe, 'results/SFinGe/cm_knn_full_SFinGe.rds')
+cm_knn_full_SFinGe
+pred_df %>%
+  roc_curve(obs, pred_A:pred_W) %>%
+  autoplot()
+
+```
+
+
+## Boost Tree on FULL data
+##### model specification
+```{r eval=FALSE, include=TRUE}
+
+ # XGBoost model specification
+xgboost_model <- 
+  parsnip::boost_tree(
+    mode = "classification",
+    trees = 100,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) %>%
+    set_engine("xgboost")
+
+# grid specification
+xgboost_params <- 
+  dials::parameters(
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction()
+  )
+
+xgboost_grid <- 
+  dials::grid_max_entropy(
+    xgboost_params, 
+    size = 4
+  )
+
+head(xgboost_grid)
+
+xgboost_wf <- 
+  workflows::workflow() %>%
+  add_model(xgboost_model) %>% 
+  add_formula(label ~ .)
+
+# hyperparameter tuning
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+cls <- makePSOCKcluster(all_cores)
+registerDoParallel(cls)
+
+set.seed(234)
+xgboost_tuned <- tune::tune_grid(
+  object = xgboost_wf,
+  resamples = tot_folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(roc_auc, accuracy),
+  control = tune::control_grid(verbose = TRUE, save_pred = TRUE))
+
+saveRDS(xgboost_tuned, '../models/xgboost_tuned.rds')
+xgboost_tuned_full <- readRDS('models/SFinGe/xgboost_tuned_full.rds')
+# plot(xgboost_tuned$.notes)
+xgboost_tuned_full %>%
+  collect_metrics(metric='accuracy') %>%
+  knitr::kable()
+xgboost_tuned_full %>%
+  select_best('accuracy')
+xgboost_best_param <- xgboost_tuned_full %>%
+                        select_best('roc_auc')
+
+# fit the model on all the training data
+xgboost_final <- xgboost_model %>%
+                  finalize_model(xgboost_best_param)  %>%
+                  # fit the model on all the training data
+                  fit( formula = label ~ .,data = tot_train)
+
+saveRDS(xgboost_final_full, 'models/SFinGe/xgboost_final_full.rds')
+xgboost_final_full <- readRDS('models/SFinGe/xgboost_final_full.rds')
+
+```
+
+#### Testing model on Test data
+```{r eval=TRUE, include=TRUE}
+xgboost_final_full <- readRDS('models/SFinGe/xgboost_final_full.rds')
+
+pred_df <- bind_cols(
+    testing(tot_split)$label,
+    predict(xgboost_final_full, tot_test),
+    predict(xgboost_final_full, tot_test, type = "prob"))
+colnames(pred_df) <- c("obs","pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+
+saveRDS(pred_df, 'results/SFinGe/xgboost_final_pred_df.rds')
+pred_df <- readRDS('results/SFinGe/xgboost_final_pred_df.rds')
+
+pred_df %>%
+  f_meas(obs, pred)
+
+cm_xgboost_full <- confusionMatrix(pred_df$pred, testing(tot_split)$label)
+cm_xgboost_full
+saveRDS(cm_xgboost_full, 'results/SFinGe/cm_xgboost_full.rds')
+pred_df %>%
+  roc_curve(obs, pred_A:pred_W) %>%
+  autoplot()
+
+```
+
+
+
+#### Feature Importance
+```{r eval=FALSE, include=TRUE}
+xgboost_final_full <- readRDS('models/SFinGe/xgboost_final_full.rds')
+imp_df = xgb.importance(model=xgboost_final_full$fit)
+head(imp_df$Feature, 10)
+saveRDS(imp_df, 'models/SFinGe/feature_imp.rds')
+```
+```{r}
+imp_df <- readRDS('models/SFinGe/feature_imp.rds')
+xgb.importance(model=xgboost_final_full$fit) %>% xgb.ggplot.importance(top_n=50, measure=NULL, rel_to_first = FALSE) 
+dim(imp_df)
+```
+
+## Selecting features from Boost Trees
+```{r Feature Selection, eval=TRUE, include=TRUE}
+nf <- 300
+dftrain <- training(tot_split) %>% dplyr::select(imp_df$Feature[1:nf], label)
+dftest <- testing(tot_split)  %>% dplyr::select(imp_df$Feature[1:nf])
+ytest <- testing(tot_split)$label
+df_folds <- vfold_cv(training(tot_split) %>%
+                       dplyr::select(imp_df$Feature[1:nf], label), v = 5, strata = label)
+
+dim(dftrain)
+dim(dftest)
+```
+
+
+## Boost Tree with Feature Selection
+##### model specification
+```{r eval=FALSE, include=TRUE}
+
+  # XGBoost model specification
+xgboost_model <- parsnip::boost_tree(mode = "classification",
+                                      trees = 100,
+                                      min_n = tune(),
+                                      tree_depth = tune(),
+                                      learn_rate = tune(),
+                                      loss_reduction = tune()) %>%
+                                      set_engine("xgboost")
+
+# grid specification
+xgboost_params <- dials::parameters(min_n(),
+                            tree_depth(),
+                            learn_rate(),
+                            loss_reduction())
+
+xgboost_grid <- dials::grid_max_entropy(
+                            xgboost_params, 
+                            size = 4)
+
+head(xgboost_grid)
+
+xgboost_wf <- workflow() %>%
+                add_model(xgboost_model) %>% 
+                add_formula(label ~ .)
+
+# hyper parameter tuning
+library(doParallel)
+all_cores <- detectCores(logical = FALSE)
+cls <- makePSOCKcluster(all_cores)
+registerDoParallel(cls)
+set.seed(234)
+## Grid Tune
+xgboost_tuned_features <- tune_grid(
+  object = xgboost_wf,
+  resamples = df_folds,
+  grid = xgboost_grid,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_grid(verbose = TRUE, save_pred = TRUE))
+
+saveRDS(xgboost_tuned_features, 'models/SFinGe/xgboost_tuned_features.rds')
+xgboost_tuned_features <- readRDS('models/SFinGe/xgboost_tuned_features.rds')
+
+xgboost_tuned_features %>%
+  collect_metrics(metric='accuracy') %>%
+  knitr::kable()
+xgboost_tuned_features %>%
+  select_best('accuracy')
+
+xgboost_best_param <- xgboost_tuned_features %>%
+                        select_best('roc_auc')
+## fit the model on all the training data
+xgboost_final_features <- xgboost_model %>%
+                  finalize_model(xgboost_best_param)  %>%
+                  # fit the model on all the training data
+                  fit( formula = label ~ .,data = dftrain)
+
+saveRDS(xgboost_final_features, 'models/SFinGe/xgboost_final_features.rds')
+xgboost_final_features <- readRDS('models/SFinGe/xgboost_final_features.rds')
+
+```
+
+#### Testing model on Test data
+```{r Predictions and accuracies on Test data, eval=TRUE, include=TRUE}
+xgboost_final_features <- readRDS('models/SFinGe/xgboost_final_features.rds')
+
+pred_df <- bind_cols(
+    testing(tot_split)$label,
+    predict(xgboost_final_features, dftest),
+    predict(xgboost_final_features, dftest, type = "prob"))
+saveRDS(pred_df, 'results/SFinGe/xgboost_features_pred_df.rds')
+
+pred_df <- readRDS('results/SFinGe/xgboost_features_pred_df.rds')
+
+colnames(pred_df) <- c("obs","pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+
+pred_df %>%
+  f_meas(obs, pred)
+
+cm_xgboost_features <- confusionMatrix(pred_df$pred, testing(tot_split)$label)
+# saveRDS(cm_xgboost_features, 'results/SFinGe/cm_xgboost_features.rds')
+cm_xgboost_features <- readRDS('results/SFinGe/cm_xgboost_features.rds')
+cm_xgboost_features
+pred_df %>%
+  roc_curve(obs, pred_A:pred_W) %>%
+  autoplot()
+```
+
+
+## KNN nearest neighbours on selected Features
+### Bayesian Optimization for Hyper parameter Tuning
+##### Model Specification
+```{r Model Specification of knn with selected features, eval=FALSE, include=TRUE}
+knn_rec <- recipe(label ~ ., data=tot_train) %>%
+  step_scale(all_numeric_predictors)
+
+knn_mod <- 
+  nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+knn_wflow <- 
+  workflow() %>% 
+  add_model(knn_mod) %>% 
+  add_recipe(knn_rec)
+
+knn_param <- 
+  knn_wflow %>% 
+  parameters() %>% 
+    update(
+    neighbors = neighbors(c(3, 30)),
+    weight_func = weight_func(values = c("rectangular", "gaussian", "triangular"))
+  )
+
+# ctrl <- control_bayes(verbose = TRUE)
+# set.seed(2022)
+# knn_search <- tune_bayes(knn_wflow, resamples = df_fold, initial = 5, iter = 20,
+#                          param_info = knn_param, control = ctrl)
+# saveRDS(knn_search, 'models/SFinGe/knn_tuned_features.rds')
+knn_tuned_features <- readRDS('models/SFinGe/knn_tuned_features.rds')
+
+```
+
+```{r Trainig full model with tuned parameters, eval=FALSE, include=TRUE}
+knn_best_param <- knn_tuned_features %>% select_best('roc_auc')
+
+knn_final_features <- knn_mod %>% finalize_model(knn_best_param) %>%
+                  # fit the model on all the training data
+                  fit( formula = label ~ .,data = dftrain)
+
+knn_final_features$fit$fitted.values
+saveRDS(knn_final_features, 'models/SFinGe/knn_final_features.rds')
+knn_final_features <- readRDS('models/SFinGe/knn_final_features.rds')
+```
+
+#### Predictions on Test data
+```{r Predictions on Test data, eval=TRUE, include=TRUE}
+knn_final_features <- readRDS('models/SFinGe/knn_final_features.rds')
+
+pred_df <- bind_cols(
+  ytest,
+  predict(knn_final_features, as.data.frame(tot_test)),
+  predict(knn_final_features, as.data.frame(tot_test), type = "prob"))
+saveRDS(pred_df, 'results/SFinGe/knn_features_pred_df.rds')
+pred_df <- readRDS('results/SFinGe/knn_features_pred_df.rds')
+
+colnames(pred_df) <- c("obs","pred","pred_A","pred_L", "pred_R","pred_T","pred_W")
+
+pred_df %>%
+  f_meas(obs, pred)
+
+cm_knn_features <- confusionMatrix(pred_df$pred, testing(tot_split)$label)
+
+saveRDS(cm_knn_features, 'results/SFinGe/cm_knn_features.rds')
+cm_knn_features <- readRDS('results/SFinGe/cm_knn_features.rds')
+cm_knn_features
+pred_df %>%
+  roc_curve(obs, pred_A:pred_W) %>%
+  autoplot()
+```
+
